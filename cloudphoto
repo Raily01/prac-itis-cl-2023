@@ -1,0 +1,224 @@
+#!/usr/bin/env python3
+
+import argparse
+import boto3
+import configparser
+import dominate
+import jinja2
+import os
+import sys
+from dominate.tags import *
+from typing import List
+
+
+def args():
+    parser = argparse.ArgumentParser()
+    sub_parser = parser.add_subparsers(dest='command', required=True)
+
+    sub_parser.add_parser('list', help='Printing list of albums')
+
+    upload_command = sub_parser.add_parser('upload', help='Uploading photos')
+    upload_command.add_argument('--album', type=str, dest='album', required=True)
+    upload_command.add_argument('--path', type=str, dest='path', default='.', required=False)
+
+    delete_command = sub_parser.add_parser('delete', help='Deleting album')
+    delete_command.add_argument('album', type=str, help='Album name')
+
+    sub_parser.add_parser('mksite', help="Generating and publishing web pages for photo archive")
+
+    sub_parser.add_parser('init', help="Initializing the program")
+
+    return parser
+
+
+def config():
+    try:
+        cfg_file = open(f"{os.environ['HOME']}/.config/cloudphoto/cloudphotorc")
+    except OSError:
+        print("Failed to read the configuration file", file=sys.stderr)
+        sys.exit(os.EX_CONFIG)
+    cfg = configparser.ConfigParser()
+    cfg.read_file(cfg_file)
+    try:
+        bucket = cfg['DEFAULT']['bucket']
+        aws_access_key_id = cfg['DEFAULT']['aws_access_key_id']
+        aws_secret_access_key = cfg['DEFAULT']['aws_secret_access_key']
+        region = cfg['DEFAULT']['region']
+        endpoint_url = cfg['DEFAULT']['endpoint_url']
+    except KeyError as err:
+        print(f"Missing parameter {err}")
+        sys.exit(os.EX_CONFIG)
+    cfg_file.close()
+    return bucket, endpoint_url, aws_access_key_id, aws_secret_access_key, region
+
+
+def upload(album: str, path: str, bucket: str, url: str) -> None:
+    """Upload files to Object Storage"""
+    try:
+        files = [file for file in os.listdir(path) if
+                 os.path.isfile(os.path.join(path, file)) and file.endswith(('.jpg', '.jpeg'))]
+    except FileNotFoundError:
+        print(f"Path {path} does not exist")
+        return
+    s3 = boto3.resource('s3', endpoint_url=url)
+    if not s3.Bucket(bucket) in s3.buckets.all():
+        s3.create_bucket(Bucket=bucket)
+    for f in files:
+        filename = f"{path}/{f}"
+        s3.meta.client.upload_file(filename, bucket, album + '/' + f)
+
+
+def delete(album: str, bucket: str, url: str) -> None:
+    """Delete album from Object Storage"""
+    s3 = boto3.client('s3', endpoint_url=url)
+    try:
+        objects = s3.list_objects_v2(Bucket=bucket, Prefix=album + '/')
+        if 'Contents' in objects:
+            for obj in objects['Contents']:
+                s3.delete_object(Bucket=bucket, Key=obj['Key'])
+            print(f"Album {album} and its photos have been deleted")
+        else:
+            print(f"Album {album} does not exist")
+    except Exception as e:
+        print(f"Failed to delete album {album}: {e}")
+
+
+def list_albums(bucket: str, url: str) -> List[str]:
+    """Display a list of albums in Object Storage"""
+    s3 = boto3.client('s3', endpoint_url=url)
+    albums = []
+    try:
+        objects = s3.list_objects_v2(Bucket=bucket, Delimiter='/')
+        if 'CommonPrefixes' in objects:
+            for prefix in objects['CommonPrefixes']:
+                album = prefix['Prefix'].rstrip('/')
+                albums.append(album)
+    except Exception as e:
+        print(f"Failed to list albums: {e}")
+    return sorted(albums)
+
+
+def generate_album_site(album_name: str, bucket: str, url: str) -> None:
+    """Generate site for an album, create and upload html file"""
+    photos = list_photos(album_name, bucket, url)
+    download(album_name, os.path.abspath('photo_site'), bucket, url, prefix=f'{album_name}-')
+    with open(os.path.join(os.path.abspath('template'), 'template.html'), 'r') as file:
+        text = file.read()
+    template = jinja2.Template(text)
+    t = template.render(title=album_name, photos=photos)
+    path = os.path.join(os.path.abspath('photo_site'), album_name + '.html')
+    with open(path, 'w') as file:
+        file.write(t)
+    upload_html(bucket, url, path, f'{album_name}.html')
+
+
+def generate_index_site(bucket: str, url: str) -> None:
+    """Generate main site - index.html"""
+    albums = list_albums(bucket, url)
+    doc = dominate.document(title='cloudphoto')
+    if not os.path.exists('photo_site'):
+        os.mkdir('photo_site')
+
+    with doc.head:
+        link(rel='stylesheet', href='style.css')
+    with doc:
+        h1('Cloudphoto')
+        with div(id='header').add(ol()):
+            for album in albums:
+                generate_album_site(album, bucket, url)
+                li(a(album, href=f'https://{bucket}.storage.yandexcloud.net/{album}.html'))
+    index_path = os.path.join(os.path.abspath('photo_site'), 'index.html')
+    with open(index_path, 'w') as file:
+        file.write(str(doc))
+    upload_html(bucket, url, index_path, 'index.html')
+
+
+def upload_html(bucket: str, url: str, path: str, name: str) -> None:
+    """Upload html file"""
+    resource = boto3.resource('s3', endpoint_url=url)
+    resource.meta.client.upload_file(path, bucket, name)
+
+
+def generate_site(bucket: str, url: str) -> str:
+    """Main method for generating site and returning the URL"""
+    generate_index_site(bucket, url)
+    session = boto3.session.Session()
+    s3 = session.client(
+        service_name='s3',
+        endpoint_url=url
+    )
+    s3.put_bucket_website(Bucket=bucket, WebsiteConfiguration={'IndexDocument': {'Suffix': 'index.html'}})
+    return f'https://{bucket}.website.yandexcloud.net'
+
+
+def init():
+    """Initialization method"""
+    config_path = f"{os.environ['HOME']}/.config/cloudphoto"
+    if not os.path.exists(config_path):
+        os.makedirs(config_path)
+
+    aws_key_id = input("Enter AWS access key ID: ")
+    aws_secret_key = input("Enter AWS secret access key: ")
+    bucket_name = input("Enter bucket name: ")
+    region = input("Enter region: ")
+    endpoint_url = input("Enter endpoint URL: ")
+
+    setting_boto(aws_key_id, aws_secret_key, region)
+    create_config_file(bucket_name, aws_key_id, aws_secret_key, region, endpoint_url)
+
+
+def setting_boto(aws_key_id: str, aws_secret_key: str, region: str) -> None:
+    """Configure boto3 credentials"""
+    aws_path = f"{os.environ['HOME']}/.aws"
+    if not os.path.exists(aws_path):
+        os.mkdir(aws_path)
+    with open(aws_path + '/credentials', 'w') as file:
+        file.write("[default]\n")
+        file.write(f"\t\taws_access_key_id = {aws_key_id}\n")
+        file.write(f"\t\taws_secret_access_key = {aws_secret_key}")
+    with open(aws_path + '/config', 'w') as file:
+        file.write("[default]\n")
+        file.write(f"\t\tregion={region}")
+
+
+def create_config_file(bucket: str, aws_key_id: str, aws_secret_key: str, region: str, endpoint_url: str) -> None:
+    """Create the configuration file"""
+    config_path = f"{os.environ['HOME']}/.config/cloudphoto"
+    config_file_path = f"{config_path}/cloudphotorc"
+    config = configparser.ConfigParser()
+    config['DEFAULT'] = {
+        'bucket': bucket,
+        'aws_access_key_id': aws_key_id,
+        'aws_secret_access_key': aws_secret_key,
+        'region': region,
+        'endpoint_url': endpoint_url
+    }
+    with open(config_file_path, 'w') as configfile:
+        config.write(configfile)
+
+
+def main():
+    """Main method"""
+    bucket_name, endpoint_url, aws_key_id, aws_secret_key, region = config()
+    setting_boto(aws_key_id, aws_secret_key, region)
+    arg_parser = args()
+    arguments = arg_parser.parse_args()
+    if arguments.command == 'upload':
+        upload(arguments.album, arguments.path, bucket_name, endpoint_url)
+    elif arguments.command == 'delete':
+        delete(arguments.album, bucket_name, endpoint_url)
+    elif arguments.command == 'list':
+        albums = list_albums(bucket_name, endpoint_url)
+        if albums:
+            for album in albums:
+                print(album)
+        else:
+            print("Photo albums not found")
+    elif arguments.command == 'mksite':
+        print(generate_site(bucket_name, endpoint_url))
+    elif arguments.command == 'init':
+        init()
+
+
+if __name__ == "__main__":
+    main()
